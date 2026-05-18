@@ -1,0 +1,36 @@
+[package]
+name = "weight-cdn-pinner"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Content-addressed weight CDN pinner — S3 + R2 + IPFS, hash-verify-on-pull"
+publish = false
+
+# NOTE: per plan §1.3 this is originally a Go service. Go is not installed in this
+# dev environment, so we ship a Rust implementation with the same interface
+# semantics. The Go variant remains the plan default; this is the working impl.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"
+
+[[bin]]
+name = "weight-cdn-pinner"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
