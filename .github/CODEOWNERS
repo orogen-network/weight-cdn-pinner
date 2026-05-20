@@ -1,0 +1,21 @@
+# CODEOWNERS -- split-repo release gate ownership.
+# The teams below must exist in the orogen-network GitHub organization.
+
+* @orogen-network/maintainers
+
+# CI and supply-chain critical files require Security review.
+.github/ @orogen-network/security
+.github/workflows/ @orogen-network/security
+.github/CODEOWNERS @orogen-network/security
+Cargo.toml @orogen-network/security
+Cargo.lock @orogen-network/security
+pyproject.toml @orogen-network/security
+uv.lock @orogen-network/security
+package.json @orogen-network/security
+package-lock.json @orogen-network/security
+
+# Source changes require domain owners.
+src/ @orogen-network/security
+runtime/ @orogen-network/chain @orogen-network/security
+pallets/ @orogen-network/chain @orogen-network/security
+terraform/ @orogen-network/sre @orogen-network/security

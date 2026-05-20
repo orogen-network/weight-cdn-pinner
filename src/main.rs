@@ -38,7 +38,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let pinner = Pinner::new(&cli.cache_dir);
     match cli.cmd {
-        Cmd::Pin { model_id, sha256, mirror, size_bytes } => {
+        Cmd::Pin {
+            model_id,
+            sha256,
+            mirror,
+            size_bytes,
+        } => {
             let mut expected = [0u8; 32];
             hex::decode_to_slice(sha256.trim_start_matches("0x"), &mut expected)?;
             let entry = ModelEntry {

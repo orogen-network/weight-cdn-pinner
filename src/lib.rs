@@ -12,6 +12,7 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -19,11 +20,13 @@ use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
-    pub model_id: String,        // 0x-prefixed H256
+    pub model_id: String, // 0x-prefixed H256
     pub expected_sha256: [u8; 32],
-    pub mirrors: Vec<String>,    // s3://..., r2://..., ipfs://...
+    pub mirrors: Vec<String>, // s3://..., r2://..., ipfs://...
     pub size_bytes: u64,
 }
+
+pub const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 impl ModelEntry {
     pub fn expected_hex(&self) -> String {
@@ -47,6 +50,8 @@ pub enum PinError {
     ForbiddenMirrorUrl(String),
     #[error("invalid model_id: {0}")]
     InvalidModelId(String),
+    #[error("download too large: limit {limit} bytes, got at least {actual} bytes")]
+    DownloadTooLarge { limit: u64, actual: u64 },
 }
 
 /// 64-char (optionally `0x`-prefixed) hex SHA-256 / H256. Reject anything else
@@ -61,10 +66,13 @@ fn is_valid_model_id(s: &str) -> bool {
 /// any non-private public hostname is allowed. RFC1918, loopback, link-local,
 /// and metadata IPs are always rejected.
 fn validate_mirror_url(url: &str) -> Result<(), PinError> {
-    let parsed = Url::parse(url).map_err(|e| PinError::ForbiddenMirrorUrl(format!("parse error: {e}")))?;
+    let parsed =
+        Url::parse(url).map_err(|e| PinError::ForbiddenMirrorUrl(format!("parse error: {e}")))?;
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
-        return Err(PinError::ForbiddenMirrorUrl(format!("unsupported scheme: {scheme}")));
+        return Err(PinError::ForbiddenMirrorUrl(format!(
+            "unsupported scheme: {scheme}"
+        )));
     }
     if parsed.username() != "" || parsed.password().is_some() {
         return Err(PinError::ForbiddenMirrorUrl(
@@ -82,22 +90,40 @@ fn validate_mirror_url(url: &str) -> Result<(), PinError> {
         .and_then(|s| s.strip_suffix(']'))
         .map(|s| s.to_string())
         .unwrap_or(raw_host);
-    if matches!(host.as_str(),
-        "localhost" | "metadata.google.internal" | "metadata.azure.com" | "metadata"
-        | "169.254.169.254" | "100.100.100.200")
-    {
-        return Err(PinError::ForbiddenMirrorUrl(format!("forbidden host: {host}")));
+    if matches!(
+        host.as_str(),
+        "localhost"
+            | "metadata.google.internal"
+            | "metadata.azure.com"
+            | "metadata"
+            | "169.254.169.254"
+            | "100.100.100.200"
+    ) {
+        return Err(PinError::ForbiddenMirrorUrl(format!(
+            "forbidden host: {host}"
+        )));
     }
     // Allow-list, if configured (host suffix match — accommodates wildcards
     // like `*.r2.cloudflarestorage.com`).
     if let Ok(allow) = std::env::var("WEIGHT_PIN_ALLOWED_HOSTS") {
         let allowed: Vec<String> = allow
             .split(',')
-            .map(|s| s.trim().trim_start_matches('*').trim_start_matches('.').to_ascii_lowercase())
+            .map(|s| {
+                s.trim()
+                    .trim_start_matches('*')
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase()
+            })
             .filter(|s| !s.is_empty())
             .collect();
-        if !allowed.is_empty() && !allowed.iter().any(|a| host == *a || host.ends_with(&format!(".{a}"))) {
-            return Err(PinError::ForbiddenMirrorUrl(format!("host {host} not in allow-list")));
+        if !allowed.is_empty()
+            && !allowed
+                .iter()
+                .any(|a| host == *a || host.ends_with(&format!(".{a}")))
+        {
+            return Err(PinError::ForbiddenMirrorUrl(format!(
+                "host {host} not in allow-list"
+            )));
         }
     }
     // If the host is a literal IP, reject private/loopback/link-local immediately.
@@ -109,11 +135,43 @@ fn validate_mirror_url(url: &str) -> Result<(), PinError> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         if ip_is_forbidden(&ip) {
             // 169.254.169.254 et al. are always forbidden, even with the loopback flag.
-            let metadata_ip = ip.to_string() == "169.254.169.254"
-                || ip.to_string() == "100.100.100.200";
+            let metadata_ip =
+                ip.to_string() == "169.254.169.254" || ip.to_string() == "100.100.100.200";
             if metadata_ip || !(allow_loopback && ip.is_loopback()) {
                 return Err(PinError::ForbiddenMirrorUrl(format!("forbidden ip: {ip}")));
             }
+        }
+    }
+    Ok(())
+}
+
+async fn validate_resolved_host(url: &str) -> Result<(), PinError> {
+    let parsed =
+        Url::parse(url).map_err(|e| PinError::ForbiddenMirrorUrl(format!("parse error: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| PinError::ForbiddenMirrorUrl("url has no host".to_string()))?;
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| PinError::ForbiddenMirrorUrl("url has no port".to_string()))?;
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| PinError::ForbiddenMirrorUrl(format!("dns lookup failed: {e}")))?;
+    let allow_loopback = std::env::var("WEIGHT_PIN_ALLOW_LOOPBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    for addr in addrs {
+        let ip = addr.ip();
+        if ip_is_forbidden(&ip) {
+            if allow_loopback && ip.is_loopback() {
+                continue;
+            }
+            return Err(PinError::ForbiddenMirrorUrl(format!(
+                "host {host} resolved to forbidden ip: {ip}"
+            )));
         }
     }
     Ok(())
@@ -219,8 +277,12 @@ impl Pinner {
         let bytes = if mirror.starts_with("http://") || mirror.starts_with("https://") {
             // SSRF defence (MED-SVC-013).
             validate_mirror_url(mirror)?;
-            self.fetch_http(mirror).await?
-        } else if mirror.starts_with("s3://") || mirror.starts_with("r2://") || mirror.starts_with("ipfs://") {
+            validate_resolved_host(mirror).await?;
+            self.fetch_http(mirror, entry.size_bytes).await?
+        } else if mirror.starts_with("s3://")
+            || mirror.starts_with("r2://")
+            || mirror.starts_with("ipfs://")
+        {
             // For S3/R2/IPFS we delegate to an HTTP gateway. In production a real
             // S3 SDK + IPFS daemon would replace this; for the skeleton + tests we
             // accept that mirrors are pre-resolved to HTTP gateways by config.
@@ -241,10 +303,35 @@ impl Pinner {
         Ok(bytes)
     }
 
-    async fn fetch_http(&self, url: &str) -> Result<Vec<u8>, PinError> {
+    async fn fetch_http(&self, url: &str, expected_size: u64) -> Result<Vec<u8>, PinError> {
+        let limit = if expected_size > 0 {
+            expected_size
+        } else {
+            std::env::var("WEIGHT_PIN_MAX_DOWNLOAD_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_MAX_DOWNLOAD_BYTES)
+        };
         let resp = self.http.get(url).send().await?;
-        let bytes = resp.bytes().await?;
-        Ok(bytes.to_vec())
+        if let Some(len) = resp.content_length() {
+            if len > limit {
+                return Err(PinError::DownloadTooLarge { limit, actual: len });
+            }
+        }
+        let mut out = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let next_len = (out.len() as u64).saturating_add(chunk.len() as u64);
+            if next_len > limit {
+                return Err(PinError::DownloadTooLarge {
+                    limit,
+                    actual: next_len,
+                });
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 
     /// Serve a cached blob for local worker daemon (e.g. via Unix socket / HTTP).
@@ -375,7 +462,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let pinner = Pinner::new(tmp.path());
         let entry = sample_entry(b"hello world", vec![]);
-        tokio::fs::write(pinner.cache_path(&entry.model_id), b"hello world").await.unwrap();
+        tokio::fs::write(pinner.cache_path(&entry.model_id), b"hello world")
+            .await
+            .unwrap();
         assert!(pinner.is_cached(&entry).await.unwrap());
     }
 
@@ -384,7 +473,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let pinner = Pinner::new(tmp.path());
         let entry = sample_entry(b"hello world", vec![]);
-        tokio::fs::write(pinner.cache_path(&entry.model_id), b"corrupted").await.unwrap();
+        tokio::fs::write(pinner.cache_path(&entry.model_id), b"corrupted")
+            .await
+            .unwrap();
         assert!(!pinner.is_cached(&entry).await.unwrap());
     }
 
@@ -402,6 +493,30 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let pinner = Pinner::new(tmp.path());
         let entry = sample_entry(b"hello world", vec![format!("{}/blob", server.url())]);
+
+        let result = pinner.fetch_and_pin(&entry).await;
+        mock.assert_async().await;
+        match result {
+            Err(PinError::NoMirrorAvailable { .. }) => {}
+            other => panic!("expected NoMirrorAvailable, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_body_larger_than_declared_size() {
+        let _g = LoopbackTestGuard::new();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/blob")
+            .with_status(200)
+            .with_body("too large")
+            .create_async()
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let pinner = Pinner::new(tmp.path());
+        let mut entry = sample_entry(b"too large", vec![format!("{}/blob", server.url())]);
+        entry.size_bytes = 3;
 
         let result = pinner.fetch_and_pin(&entry).await;
         mock.assert_async().await;
